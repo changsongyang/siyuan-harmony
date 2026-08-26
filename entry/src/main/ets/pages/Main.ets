@@ -21,6 +21,7 @@ import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { BusinessError, deviceInfo, emitter } from '@kit.BasicServicesKit';
 import { common, wantAgent, WantAgent } from '@kit.AbilityKit';
 import { webview } from '@kit.ArkWeb';
+import { http } from '@kit.NetworkKit';
 import napi from 'libentry.so';
 import { isNativeTextSelectionMenuDisabled, JSHarmony, SaveExportFileResultEventData } from './JSHarmony';
 import { Utils } from './Utils';
@@ -28,6 +29,16 @@ import { window } from '@kit.ArkUI';
 import { inputMethod } from '@kit.IMEKit';
 import inputDevice from '@ohos.multimodalInput.inputDevice';
 import { LANSyncMDNS } from './LANSyncMDNS';
+
+interface BootProgressData {
+  progress: number;
+}
+
+interface BootProgressResponse {
+  data?: BootProgressData;
+}
+
+const MAIN_PAGE_LOAD_TIMEOUT: number = 30000;
 
 /**
  * 主程序。
@@ -43,10 +54,22 @@ struct Main {
   jsHarmony: JSHarmony = new JSHarmony();
   @State isFocusable: boolean = false;
   @State keyBoards: Map<number, inputDevice.KeyboardType> = new Map();
+  @State mediaPlaybackRequiresUserGesture: boolean = false;
   @State editMenuOptions: EditMenuOptions = {
     onCreateMenu: this.onCreateMenu,
     onMenuItemClick: this.onMenuItemClick
   };
+  private bootProgressRequest?: http.HttpRequest;
+  private bootProgressMonitorActive: boolean = false;
+  private kernelBootCompleted: boolean = false;
+  private mainPageNavigationStarted: boolean = false;
+  private mainPageReady: boolean = false;
+  private webViewRecoveryScheduled: boolean = false;
+  private forceDefaultBootAppearance: boolean = false;
+  private pageActive: boolean = true;
+  private bootProgressMonitorGeneration: number = 0;
+  private bootProgressPollTimerID: number = -1;
+  private mainPageWatchdogID: number = -1;
 
   private deliverOIDCCallback(): void {
     const callback = AppStorage.get<string>('oidcCallback') ?? '';
@@ -106,7 +129,7 @@ struct Main {
         .imageAccess(true)
         .onlineImageAccess(true)
         .cacheMode(CacheMode.Online)
-        .mediaPlayGestureAccess(true)
+        .mediaPlayGestureAccess(this.mediaPlaybackRequiresUserGesture)
         .mixedMode(MixedMode.All)
         .zoomAccess(false)
         .textZoomRatio(100)
@@ -116,6 +139,67 @@ struct Main {
           if (event) {
             this.handlePermissionRequest(event);
           }
+        })
+        .onPageBegin((event) => {
+          const url = event?.url;
+          if (url && url.startsWith("http://127.0.0.1:6806/") &&
+            0 > url.indexOf("/appearance/boot/")) {
+            this.mediaPlaybackRequiresUserGesture = true;
+            this.mainPageNavigationStarted = true;
+            this.mainPageReady = false;
+          }
+        })
+        .onPageEnd((event) => {
+          const url = event?.url;
+          if (this.isReadyMainPage(url)) {
+            this.stopBootProgressMonitor();
+            this.kernelBootCompleted = true;
+            this.mainPageNavigationStarted = true;
+            this.mainPageReady = true;
+            this.forceDefaultBootAppearance = false;
+            this.cancelMainPageWatchdog();
+          }
+        })
+        .onErrorReceive((event) => {
+          if (event && event.request.isMainFrame()) {
+            hilog.error(0x0000, "siyuan",
+              "main frame load failed [url=" + event.request.getRequestUrl() + "]");
+            this.forceDefaultBootAppearance = true;
+            this.mainPageReady = false;
+            this.scheduleWebViewRecovery();
+          }
+        })
+        .onHttpErrorReceive((event) => {
+          if (event && event.request.isMainFrame()) {
+            hilog.error(0x0000, "siyuan",
+              "main frame HTTP error [url=" + event.request.getRequestUrl() + "]");
+            this.forceDefaultBootAppearance = true;
+            this.mainPageReady = false;
+            this.scheduleWebViewRecovery();
+          }
+        })
+        .onRenderExited(() => {
+          hilog.error(0x0000, "siyuan", "web render process exited");
+          this.forceDefaultBootAppearance = true;
+          this.mainPageNavigationStarted = false;
+          this.mainPageReady = false;
+          this.scheduleWebViewRecovery();
+        })
+        .onRenderProcessNotResponding((data) => {
+          if (this.mainPageReady || this.webViewRecoveryScheduled) {
+            return;
+          }
+          hilog.error(0x0000, "siyuan", "web render process is not responding during startup [process=" +
+            data.pid + ", reason=" + data.reason + "]");
+          this.forceDefaultBootAppearance = true;
+          this.mainPageNavigationStarted = false;
+          this.mainPageReady = false;
+          try {
+            this.controller.terminateRenderProcess();
+          } catch (e) {
+            hilog.error(0x0000, "siyuan", "terminate unresponsive web render process failed: " + e);
+          }
+          this.scheduleWebViewRecovery();
         })
         .onControllerAttached(() => {
           const context = Utils.getContext();
@@ -220,6 +304,7 @@ struct Main {
   }
 
   async aboutToAppear() {
+    this.pageActive = true;
     try {
       Utils.setUIContext(this.getUIContext());
     } catch (e) {
@@ -255,6 +340,42 @@ struct Main {
         this.keyBoards.delete(data.deviceId);
       }
     });
+
+    if (napi.isHttpServing()) {
+      if (this.kernelBootCompleted) {
+        this.mainPageNavigationStarted = false;
+        this.navigateToMainPage();
+      } else {
+        if (this.forceDefaultBootAppearance) {
+          this.loadBootPage();
+        }
+        this.startBootProgressMonitor();
+      }
+    }
+  }
+
+  aboutToDisappear(): void {
+    this.pageActive = false;
+    this.cancelMainPageWatchdog();
+    this.stopBootProgressMonitor();
+  }
+
+  private stopBootProgressMonitor(): void {
+    this.bootProgressMonitorActive = false;
+    this.bootProgressMonitorGeneration++;
+    if (0 <= this.bootProgressPollTimerID) {
+      clearTimeout(this.bootProgressPollTimerID);
+      this.bootProgressPollTimerID = -1;
+    }
+    const request = this.bootProgressRequest;
+    this.bootProgressRequest = undefined;
+    if (request) {
+      try {
+        request.destroy();
+      } catch (e) {
+        hilog.debug(0x0000, "siyuan", "destroy boot progress request failed: " + e);
+      }
+    }
   }
 
   // 移动端容器启用桌面模式时，前端加载的是桌面 bundle（/stage/build/desktop/），
@@ -326,9 +447,11 @@ struct Main {
         hilog.info(0x0000, "siyuan",
           "started kernel [appDir=" + appDir + ", workspaceBaseDir=" + workspaceBaseDir + ", localIPs=" + localIPs +
             ", osVer=" + osVer + "]");
-        this.waitFotKernelHttpServing();
-        this.controller.loadUrl("http://127.0.0.1:6806/appearance/boot/index.html?v=" + Utils.appVer);
-        hilog.info(0x0000, "siyuan", "load boot page");
+        this.waitFotKernelHttpServing().then(() => {
+          this.loadBootPage();
+          this.startBootProgressMonitor();
+          hilog.info(0x0000, "siyuan", "load boot page");
+        });
 
         this.listenKeyboard();
       }).catch((err: BusinessError) => {
@@ -336,6 +459,167 @@ struct Main {
         Utils.exit();
       });
     });
+  }
+
+  private loadBootPage(): void {
+    this.mediaPlaybackRequiresUserGesture = false;
+    this.mainPageNavigationStarted = false;
+    this.mainPageReady = false;
+    const safeParameter = this.forceDefaultBootAppearance ? "&appearance=0" : "";
+    try {
+      this.controller.loadUrl("http://127.0.0.1:6806/appearance/boot/index.html?v=" + Utils.appVer + safeParameter);
+    } catch (e) {
+      hilog.error(0x0000, "siyuan", "load boot page failed: " + e);
+      this.forceDefaultBootAppearance = true;
+      this.scheduleWebViewRecovery();
+    }
+  }
+
+  private startBootProgressMonitor(): void {
+    if (!this.pageActive) {
+      return;
+    }
+    if (this.kernelBootCompleted) {
+      this.navigateToMainPage();
+      return;
+    }
+    if (this.bootProgressMonitorActive) {
+      return;
+    }
+
+    this.bootProgressMonitorActive = true;
+    const generation = ++this.bootProgressMonitorGeneration;
+    this.pollBootProgress(generation);
+  }
+
+  private pollBootProgress(generation: number): void {
+    if (!this.bootProgressMonitorActive || generation !== this.bootProgressMonitorGeneration) {
+      return;
+    }
+
+    const request = http.createHttp();
+    this.bootProgressRequest = request;
+    request.request("http://127.0.0.1:6806/api/system/bootProgress", {
+      method: http.RequestMethod.GET,
+      expectDataType: http.HttpDataType.STRING,
+      usingCache: false,
+      connectTimeout: 1000,
+      readTimeout: 1000
+    }, (error: BusinessError, response: http.HttpResponse) => {
+      if (this.bootProgressRequest === request) {
+        this.bootProgressRequest = undefined;
+      }
+      try {
+        request.destroy();
+      } catch (e) {
+        hilog.debug(0x0000, "siyuan", "destroy boot progress request failed: " + e);
+      }
+
+      let completed = false;
+      if (!error && 200 === response.responseCode && typeof response.result === "string") {
+        try {
+          const result = JSON.parse(response.result) as BootProgressResponse;
+          completed = (result.data?.progress ?? 0) >= 100;
+        } catch (e) {
+          completed = false;
+        }
+      }
+
+      if (!this.bootProgressMonitorActive || generation !== this.bootProgressMonitorGeneration) {
+        return;
+      }
+      if (completed) {
+        this.stopBootProgressMonitor();
+        this.kernelBootCompleted = true;
+        this.navigateToMainPage();
+        return;
+      }
+      this.bootProgressPollTimerID = setTimeout(() => {
+        this.bootProgressPollTimerID = -1;
+        this.pollBootProgress(generation);
+      }, 200);
+    });
+  }
+
+  private navigateToMainPage(): void {
+    if (!this.kernelBootCompleted || !this.pageActive) {
+      return;
+    }
+    this.scheduleMainPageWatchdog();
+    if (this.mainPageReady) {
+      this.mainPageNavigationStarted = true;
+      this.cancelMainPageWatchdog();
+      return;
+    }
+    if (this.mainPageNavigationStarted) {
+      return;
+    }
+
+    this.mediaPlaybackRequiresUserGesture = true;
+    this.mainPageNavigationStarted = true;
+    this.mainPageReady = false;
+    this.forceDefaultBootAppearance = false;
+    try {
+      this.controller.loadUrl("http://127.0.0.1:6806/");
+    } catch (e) {
+      hilog.error(0x0000, "siyuan", "load main page failed: " + e);
+      this.mainPageNavigationStarted = false;
+      this.scheduleWebViewRecovery();
+    }
+  }
+
+  private isReadyMainPage(url?: string): boolean {
+    return !!url && (-1 < url.indexOf("/stage/build/") || -1 < url.indexOf("/check-auth"));
+  }
+
+  private scheduleMainPageWatchdog(): void {
+    if (!this.kernelBootCompleted || !this.pageActive) {
+      return;
+    }
+    this.cancelMainPageWatchdog();
+    this.mainPageWatchdogID = setTimeout(() => {
+      this.mainPageWatchdogID = -1;
+      if (!this.kernelBootCompleted || !this.pageActive) {
+        return;
+      }
+      if (this.mainPageReady) {
+        return;
+      }
+
+      hilog.error(0x0000, "siyuan", "main page load timed out, reload it");
+      this.mainPageNavigationStarted = false;
+      this.navigateToMainPage();
+    }, MAIN_PAGE_LOAD_TIMEOUT);
+  }
+
+  private cancelMainPageWatchdog(): void {
+    if (0 <= this.mainPageWatchdogID) {
+      clearTimeout(this.mainPageWatchdogID);
+      this.mainPageWatchdogID = -1;
+    }
+  }
+
+  private scheduleWebViewRecovery(): void {
+    if (this.webViewRecoveryScheduled) {
+      return;
+    }
+    this.mainPageReady = false;
+    this.webViewRecoveryScheduled = true;
+    setTimeout(() => {
+      this.webViewRecoveryScheduled = false;
+      if (!this.pageActive) {
+        return;
+      }
+      if (this.kernelBootCompleted) {
+        this.mainPageNavigationStarted = false;
+        this.navigateToMainPage();
+      } else {
+        this.mainPageNavigationStarted = false;
+        this.forceDefaultBootAppearance = true;
+        this.loadBootPage();
+        this.startBootProgressMonitor();
+      }
+    }, 300);
   }
 
   async waitFotKernelHttpServing() {
