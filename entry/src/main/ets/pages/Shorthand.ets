@@ -19,6 +19,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
+import { ShorthandDraftStore } from '../shorthand/ShorthandDraftStore';
 
 /**
  * 闪念速记页面。
@@ -30,58 +31,87 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 @Entry
 @Component
 struct Shorthand {
-  // 用 @StorageLink 双向绑定，Ability 写入后页面立即同步；首屏加载时 shareInput 已就绪
-  @StorageLink('shareInput') @Watch('onShareInputChange') shareInputProp: string = '';
-  @State inputText: string = '';
+  @StorageLink('shorthandText') @Watch('onInputTextChange') inputText: string = '';
+  @StorageLink('shorthandPending') @Watch('onPendingChange') pendingInputCount: number = 0;
   @State submitEnabled: boolean = false;
+  @State submitting: boolean = false;
 
   aboutToAppear(): void {
-    // Ability 侧已确保 loadContent 在 shareInput 写入 AppStorage 后才执行，这里同步读取一定能拿到值
-    const shareInput = AppStorage.get("shareInput") as string ?? '';
-    if (shareInput) {
-      this.inputText += '\n\n' + shareInput;
-      this.inputText = this.inputText.trim();
-      this.submitEnabled = this.inputText.trim().length > 0;
-    }
+    this.refreshSubmitEnabled();
   }
 
-  onShareInputChange(): void {
-    // Ability 在 onNewWant 处理前会先把 shareInput 清空为 ""，这里跳过空值避免误清空用户正在编辑的内容
-    if (this.shareInputProp) {
-      this.inputText += '\n\n' + this.shareInputProp;
-      this.inputText = this.inputText.trim();
-      this.submitEnabled = this.inputText.trim().length > 0;
-    }
+  aboutToDisappear(): void {
+    ShorthandDraftStore.flush().catch((error: Error) => {
+      hilog.error(0x0000, 'siyuan', 'flush shorthand draft failed: ' + error.message);
+    });
   }
 
-  private onSubmit(): void {
+  onInputTextChange(): void {
+    ShorthandDraftStore.schedule(this.inputText);
+    this.refreshSubmitEnabled();
+  }
+
+  onPendingChange(): void {
+    this.refreshSubmitEnabled();
+  }
+
+  private async onSubmit(): Promise<void> {
+    if (this.submitting || 0 < this.pendingInputCount) {
+      return;
+    }
+    const rawText = this.inputText;
     const text = this.inputText.trim();
     if (!text) {
       return;
     }
+
+    this.submitting = true;
+    this.refreshSubmitEnabled();
 
     const context = AppStorage.get<common.UIAbilityContext>('shorthandContext')!;
     const workspaceBaseDir = context.filesDir + '/workspaces';
     const shorthandsDir = workspaceBaseDir + '/home/.config/siyuan/shortcuts/shorthands/';
 
     try {
-      fs.mkdirSync(shorthandsDir, true);
-    } catch (e) {
-      // ignore File exists
+      const expectedRevision = await ShorthandDraftStore.saveNow(rawText);
+      try {
+        fs.mkdirSync(shorthandsDir, true);
+      } catch (error) {
+        if (!fs.accessSync(shorthandsDir)) {
+          throw new Error('Create shorthand directory failed: ' + error);
+        }
+      }
+
+      let timestamp = Date.now();
+      let filePath = shorthandsDir + timestamp + '.md';
+      while (fs.accessSync(filePath)) {
+        timestamp++;
+        filePath = shorthandsDir + timestamp + '.md';
+      }
+      const committedRevision = await ShorthandDraftStore.promote(filePath, expectedRevision);
+      if (0 < this.pendingInputCount || !ShorthandDraftStore.isCurrentRevision(committedRevision)) {
+        this.inputText = ShorthandDraftStore.getText();
+        this.submitting = false;
+        this.refreshSubmitEnabled();
+        return;
+      }
+    } catch (error) {
+      hilog.error(0x0000, 'siyuan', 'write shorthand file failed: ' + error);
+      this.submitting = false;
+      this.refreshSubmitEnabled();
+      return;
     }
 
-    const now = Date.now();
-    const filePath = shorthandsDir + now + '.md';
+    this.inputText = '';
     try {
-      const file = fs.openSync(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE);
-      fs.writeSync(file.fd, text);
-      fs.closeSync(file);
-    } catch (e) {
-      hilog.error(0x0000, 'siyuan', 'write shorthand file failed: ' + e);
+      await context.terminateSelf();
+    } catch (error) {
+      hilog.error(0x0000, 'siyuan', 'terminate shorthand failed: ' + error);
     }
+  }
 
-    this.inputText = "";
-    context?.terminateSelf();
+  private refreshSubmitEnabled(): void {
+    this.submitEnabled = !this.submitting && 0 === this.pendingInputCount && 0 < this.inputText.trim().length;
   }
 
   build() {
@@ -115,7 +145,6 @@ struct Shorthand {
         .padding(16)
         .onChange((value: string) => {
           this.inputText = value;
-          this.submitEnabled = value.trim().length > 0;
         })
     }
     .width('100%')

@@ -23,6 +23,7 @@ import { systemShare } from '@kit.ShareKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import napi from 'libentry.so';
 import { fileIo } from '@kit.CoreFileKit';
+import { ShorthandDraftStore } from '../shorthand/ShorthandDraftStore';
 
 /**
  * 闪念速记入口。
@@ -32,30 +33,53 @@ import { fileIo } from '@kit.CoreFileKit';
  * @since 3.7.0
  */
 export default class ShorthandAbility extends UIAbility {
-  // 加载速记页面需要“分享数据解析完成”与“窗口舞台就绪”两个条件同时满足，
-  // 哪一个后到就由哪一个触发 loadContent，确保页面 aboutToAppear 执行时 shareInput 已写入 AppStorage
+  // 加载速记页面需要“首个分享数据解析完成”与“窗口舞台就绪”两个条件同时满足。
   private windowStage: window.WindowStage | null = null;
-  private shareInputResolved: boolean = false;
+  private initialWantResolved: boolean = false;
   private windowStageReady: boolean = false;
   private pageLoaded: boolean = false;
+  private pendingWantCount: number = 0;
+  private wantQueue: Promise<void> = Promise.resolve();
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, 'siyuan', 'ShorthandAbility onCreate');
     AppStorage.setOrCreate('shorthandContext', this.context);
-    // 先清空上次残留的 shareInput，避免 onNewWant 复用 singleton 时页面显示旧内容
-    AppStorage.setOrCreate('shareInput', '');
-    this.handleWant(want);
+    AppStorage.setOrCreate('shorthandText', '');
+    AppStorage.setOrCreate('shorthandPending', 0);
+    this.wantQueue = ShorthandDraftStore.initialize(this.context).then((draft: string) => {
+      AppStorage.setOrCreate('shorthandText', draft);
+    }).catch((error: Error) => {
+      hilog.error(0x0000, 'siyuan', 'load shorthand draft failed: ' + error.message);
+    });
+    this.enqueueWant(want);
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, 'siyuan', 'ShorthandAbility onNewWant');
-    // 复用 singleton 再次分享时，重置标志并清空 shareInput，页面侧通过 @Watch 感知新值
-    this.shareInputResolved = false;
-    AppStorage.setOrCreate('shareInput', '');
-    this.handleWant(want);
+    this.enqueueWant(want);
   }
 
-  private async handleWant(want: Want) {
+  private enqueueWant(want: Want): void {
+    ShorthandDraftStore.invalidateSubmission();
+    this.pendingWantCount++;
+    AppStorage.setOrCreate('shorthandPending', this.pendingWantCount);
+    this.wantQueue = this.wantQueue.then(async () => {
+      try {
+        await this.handleWant(want);
+      } finally {
+        this.pendingWantCount--;
+        AppStorage.setOrCreate('shorthandPending', this.pendingWantCount);
+        if (!this.initialWantResolved) {
+          this.initialWantResolved = true;
+          this.loadShorthandPage();
+        }
+      }
+    }).catch((error: Error) => {
+      hilog.error(0x0000, 'siyuan', 'process shorthand want failed: ' + error.message);
+    });
+  }
+
+  private async handleWant(want: Want): Promise<void> {
     let shareInput = "";
     try {
       const data = await systemShare.getSharedData(want);
@@ -77,13 +101,32 @@ export default class ShorthandAbility extends UIAbility {
       }
       shareInput = recordInputs.join("\n\n");
     } catch (e) {
-      // 解析失败时 shareInput 保持空串，页面仍能正常加载显示空输入框，避免界面卡死空白
+      // 解析失败时仍加载页面，避免界面卡死空白。
       hilog.error(0x0000, 'siyuan', 'handle want failed: ' + e);
     }
 
-    AppStorage.setOrCreate("shareInput", shareInput);
-    this.shareInputResolved = true;
-    this.loadShorthandPage();
+    if (shareInput) {
+      const current = ShorthandDraftStore.getText();
+      const merged = this.joinContent(current, shareInput);
+      AppStorage.setOrCreate('shorthandText', merged);
+      await ShorthandDraftStore.saveNow(merged);
+    }
+  }
+
+  private joinContent(existing: string, incoming: string): string {
+    if (!existing) {
+      return incoming;
+    }
+    if (!incoming) {
+      return existing;
+    }
+    if (existing.endsWith('\n\n')) {
+      return existing + incoming;
+    }
+    if (existing.endsWith('\n')) {
+      return existing + '\n' + incoming;
+    }
+    return existing + '\n\n' + incoming;
   }
 
   private handleFileRecord(record: systemShare.SharedRecord): string {
@@ -152,9 +195,9 @@ export default class ShorthandAbility extends UIAbility {
     return false;
   }
 
-  // 等分享数据解析完成且窗口舞台就绪后再加载页面，保证页面首屏即可读到 shareInput
+  // 等首个分享数据解析完成且窗口舞台就绪后再加载页面，保证首屏即可读到合并后的草稿。
   private loadShorthandPage(): void {
-    if (this.pageLoaded || !this.shareInputResolved || !this.windowStageReady || null === this.windowStage) {
+    if (this.pageLoaded || !this.initialWantResolved || !this.windowStageReady || null === this.windowStage) {
       return;
     }
     this.pageLoaded = true;
@@ -162,7 +205,16 @@ export default class ShorthandAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    ShorthandDraftStore.flush().catch((error: Error) => {
+      hilog.error(0x0000, 'siyuan', 'flush shorthand draft failed: ' + error.message);
+    });
     hilog.info(0x0000, 'siyuan', 'ShorthandAbility onDestroy');
+  }
+
+  onBackground(): void {
+    ShorthandDraftStore.flush().catch((error: Error) => {
+      hilog.error(0x0000, 'siyuan', 'flush shorthand draft failed: ' + error.message);
+    });
   }
 
   async onWindowStageCreate(windowStage: window.WindowStage) {
