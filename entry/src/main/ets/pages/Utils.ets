@@ -31,8 +31,12 @@ import napi from 'libentry.so';
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { PrintParam } from './Print';
-import { connection } from '@kit.NetworkKit';
+import { connection, http } from '@kit.NetworkKit';
 import { LANSyncMDNS } from './LANSyncMDNS';
+
+interface SystemExitResponse {
+  code: number;
+}
 
 /**
  * 工具类。
@@ -43,6 +47,7 @@ import { LANSyncMDNS } from './LANSyncMDNS';
  */
 @Component
 export struct Utils {
+  private static terminating: boolean = false;
   public static appVer =
     bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION).versionName;
   public static appVerCode =
@@ -149,6 +154,10 @@ export struct Utils {
   }
 
   static exit() {
+    if (Utils.terminating) {
+      return;
+    }
+    Utils.terminating = true;
     hilog.info(0x0000, "siyuan", "exit siyuan app")
     LANSyncMDNS.shared.stop();
     try {
@@ -165,6 +174,73 @@ export struct Utils {
       napi.exit();
     } catch (err) {
       hilog.error(0x0000, "siyuan", "exit kernel failed: " + err);
+    }
+  }
+
+  static async exitFromAbilityDestroy(): Promise<void> {
+    if (Utils.terminating) {
+      return;
+    }
+    Utils.terminating = true;
+    hilog.info(0x0000, "siyuan", "exit siyuan app from ability destroy")
+    LANSyncMDNS.shared.stop();
+
+    try {
+      if (napi.isHttpServing()) {
+        const exitCode = await Utils.requestKernelExit(false);
+        if (typeof exitCode === "number" && exitCode !== 0 && napi.isHttpServing()) {
+          hilog.warn(0x0000, "siyuan", "graceful kernel exit failed [code=" + exitCode + "]");
+          await Utils.requestKernelExit(true);
+        }
+      }
+    } catch (err) {
+      hilog.error(0x0000, "siyuan", "graceful kernel exit failed: " + err);
+    }
+
+    try {
+      backgroundTaskManager.stopBackgroundRunning(Utils.getContext());
+    } catch (err) {
+      hilog.error(0x0000, "siyuan", "stop background running failed: " + err);
+    }
+
+    try {
+      napi.exit();
+    } catch (err) {
+      hilog.error(0x0000, "siyuan", "exit kernel failed: " + err);
+    }
+  }
+
+  private static async requestKernelExit(force: boolean): Promise<number | undefined> {
+    const request = http.createHttp();
+    try {
+      const response = await request.request("http://127.0.0.1:6806/api/system/exit", {
+        method: http.RequestMethod.POST,
+        header: {
+          "Content-Type": "application/json"
+        },
+        extraData: JSON.stringify({
+          force: force,
+          setCurrentWorkspace: true,
+          execInstallPkg: 1
+        }),
+        expectDataType: http.HttpDataType.STRING,
+        usingCache: false,
+        connectTimeout: 1000,
+        readTimeout: 600000
+      });
+      if (response.responseCode !== 200 || typeof response.result !== "string") {
+        throw new Error("unexpected kernel exit response [status=" + response.responseCode + "]");
+      }
+      return (JSON.parse(response.result) as SystemExitResponse).code;
+    } catch (err) {
+      hilog.error(0x0000, "siyuan", "request kernel exit failed [force=" + force + "]: " + err);
+      return undefined;
+    } finally {
+      try {
+        request.destroy();
+      } catch (err) {
+        hilog.debug(0x0000, "siyuan", "destroy kernel exit request failed: " + err);
+      }
     }
   }
 

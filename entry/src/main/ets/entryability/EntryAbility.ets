@@ -21,7 +21,6 @@ import { emitter, screenLock } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { Utils } from '../pages/Utils';
-import { LANSyncMDNS } from '../pages/LANSyncMDNS';
 
 /**
  * 主程序入口点。
@@ -53,9 +52,9 @@ export default class EntryAbility extends UIAbility {
     emitter.emit("oidcCallback");
   }
 
-  onDestroy(): void {
+  async onDestroy(): Promise<void> {
     hilog.info(0x0000, "siyuan", 'ability onDestroy');
-    LANSyncMDNS.shared.stop();
+    await Utils.exitFromAbilityDestroy();
   }
 
   async onWindowStageCreate(windowStage: window.WindowStage): Promise<void> {
